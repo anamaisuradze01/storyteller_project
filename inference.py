@@ -1,28 +1,29 @@
-# %% [markdown]
-# # The Visual Storyteller — Inference
-#
-# Loads the trained checkpoint produced by `data_and_training.ipynb` and
-# demonstrates it on unseen images via `generate_caption(image_path, model)`,
-# as required by the assignment. Includes an attention-map visualization and
-# a section for logging successful vs. failure-case examples.
-#
-# This notebook is self-contained: the model architecture is redefined here
-# (rather than imported from the training notebook) so it can be run
-# independently once you have a checkpoint file.
-
-# %% [markdown]
-# ## 0. Setup
-
-# %%
 import os
 import random
+import re
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as transforms
-from torchvision.models import ResNet101_Weights
+from torchvision.models import ResNet50_Weights
+from PIL import Image
+import matplotlib.pyplot as plt
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
+
+import os
+import random
+import re
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
+import torchvision.transforms as transforms
+from torchvision.models import ResNet50_Weights
 from PIL import Image
 import matplotlib.pyplot as plt
 
@@ -30,20 +31,42 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
 
-# %% [markdown]
-# ## 1. Model architecture
-#
-# Identical to `model.py` / the training notebook — needed here so
-# `torch.load(...)` + `load_state_dict(...)` has a matching class to
-# populate.
+class Vocabulary:
+    def __init__(self, freq_threshold):
+        self.itos = {0: "<PAD>", 1: "<SOS>", 2: "<EOS>", 3: "<UNK>"}
+        self.stoi = {"<PAD>": 0, "<SOS>": 1, "<EOS>": 2, "<UNK>": 3}
+        self.freq_threshold = freq_threshold
 
-# %%
+    def __len__(self):
+        return len(self.itos)
+
+    @staticmethod
+    def tokenizer_eng(text):
+        text = text.lower().strip()
+        text = re.sub(r"([.,!?;:'\"])", r" \1 ", text)
+        return text.split()
+
+    def build_vocabulary(self, sentence_list):
+        frequencies = {}
+        idx = 4
+        for sentence in sentence_list:
+            for word in self.tokenizer_eng(sentence):
+                frequencies[word] = frequencies.get(word, 0) + 1
+                if frequencies[word] == self.freq_threshold:
+                    self.stoi[word] = idx
+                    self.itos[idx] = word
+                    idx += 1
+
+    def numericalize(self, text):
+        tokenized_text = self.tokenizer_eng(text)
+        return [self.stoi.get(token, self.stoi["<UNK>"]) for token in tokenized_text]
+
 class EncoderCNN(nn.Module):
-    def __init__(self, encoded_image_size=8, fine_tune=False):
+    def __init__(self, encoded_image_size=5, fine_tune=False):
         super(EncoderCNN, self).__init__()
         self.encoded_image_size = encoded_image_size
 
-        resnet = models.resnet101(weights=ResNet101_Weights.DEFAULT)
+        resnet = models.resnet50(weights=ResNet50_Weights.DEFAULT)
         modules = list(resnet.children())[:-2]
         self.resnet = nn.Sequential(*modules)
         self.adaptive_pool = nn.AdaptiveAvgPool2d((encoded_image_size, encoded_image_size))
@@ -160,6 +183,7 @@ class CNNtoRNN(nn.Module):
 
     @torch.no_grad()
     def caption_image(self, image, vocabulary, max_length=50, device="cuda"):
+        was_training = self.training
         self.eval()
         encoder_out = self.encoderCNN(image)
         h, c = self.decoderRNN.init_hidden_state(encoder_out)
@@ -181,11 +205,14 @@ class CNNtoRNN(nn.Module):
                 result_caption.append(token)
             word = predicted
 
-        self.train()
+        if was_training:
+            if was_training:
+                self.train()
         return result_caption
 
     @torch.no_grad()
     def beam_search_caption(self, image, vocabulary, max_length=50, beam_width=3, device="cuda"):
+        was_training = self.training
         self.eval()
         encoder_out = self.encoderCNN(image)
         h0, c0 = self.decoderRNN.init_hidden_state(encoder_out)
@@ -238,15 +265,6 @@ class CNNtoRNN(nn.Module):
         self.train()
         return result_caption
 
-
-# %% [markdown]
-# ## 2. Loading the trained model
-#
-# `CaptionModel` bundles the network, vocab, matching image transform, and
-# device behind one object, so the public `generate_caption(image_path, model)`
-# function can keep exactly the signature required by the assignment.
-
-# %%
 class CaptionModel:
     def __init__(self, model, vocab, transform, device, use_beam_search=True, beam_width=3):
         self.model = model
@@ -258,17 +276,28 @@ class CaptionModel:
 
     @classmethod
     def from_checkpoint(cls, checkpoint_path, device=None, use_beam_search=True, beam_width=3):
+        # Prefer CUDA when available, but inference can always run on CPU too.
         device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        checkpoint_path = str(checkpoint_path)
 
         print(f"=> Loading checkpoint: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+        except RuntimeError as e:
+            # Some CUDA checkpoints fail on small GPUs; CPU inference is slower but safer.
+            print(f"CUDA load failed ({e}). Retrying on CPU...")
+            device = torch.device("cpu")
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
         config = checkpoint["config"]
         vocab = checkpoint["vocab"]
 
-        print(f"   Experiment: {config['experiment_name']}")
-        print(f"   Epoch: {checkpoint['epoch']}")
+        print(f"   Experiment: {config.get('experiment_name', 'unknown')}")
+        print(f"   Epoch: {checkpoint.get('epoch', 'unknown')}")
         print(f"   Vocab size: {len(vocab)}")
+        print(f"   Inference device: {device}")
 
         model = CNNtoRNN(
             embed_size=config["embed_size"],
@@ -278,7 +307,7 @@ class CaptionModel:
             dropout=config.get("dropout", 0.5),
         ).to(device)
 
-        model.load_state_dict(checkpoint["state_dict"])
+        model.load_state_dict(checkpoint["state_dict"], strict=True)
         model.eval()
 
         transform = transforms.Compose([
@@ -290,11 +319,6 @@ class CaptionModel:
 
         return cls(model, vocab, transform, device, use_beam_search, beam_width)
 
-
-# %% [markdown]
-# ## 3. `generate_caption` — required inference function
-
-# %%
 def generate_caption(image_path: str, model: "CaptionModel") -> str:
     """
     Takes a path to an image and returns a generated caption string.
@@ -331,20 +355,12 @@ def generate_captions_for_dir(image_dir, model, extensions=(".jpg", ".jpeg", ".p
             results[fname] = generate_caption(path, model)
     return results
 
-
-# %% [markdown]
-# ## 4. Attention visualization
-#
-# Runs greedy decoding while keeping the per-step attention weights, so you
-# can see which image regions the model attended to for each generated word
-# — useful supporting evidence for the Analysis section below.
-
-# %%
 def get_attention_map(model, image_tensor, vocab, device, max_length=50):
     """
     Returns (words, alphas) where alphas is a list of (S, S) attention
     grids, one per generated word (S = encoder's spatial grid size).
     """
+    was_training = model.training
     model.eval()
     with torch.no_grad():
         encoder_out = model.encoderCNN(image_tensor)
@@ -372,20 +388,27 @@ def get_attention_map(model, image_tensor, vocab, device, max_length=50):
 
             word = predicted
 
-    model.train()
+    if was_training:
+        model.train()
     return words, alphas
 
 
 def plot_attention(image_path, words, alphas, max_words=12):
-    """Plots the image once per generated word with the attention grid
-    overlaid, up to max_words words."""
+    """Plots the image once per generated word with the attention grid overlaid."""
+    if len(words) == 0 or len(alphas) == 0:
+        print("No attention map to plot because the generated caption is empty.")
+        return
+
     image = Image.open(image_path).convert("RGB").resize((224, 224))
-    n = min(len(words), max_words)
+    n = min(len(words), len(alphas), max_words)
     cols = 4
     rows = (n + cols - 1) // cols
 
     fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
-    axes = axes.flatten() if n > 1 else [axes]
+    if rows == 1 and cols == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten()
 
     for i in range(n):
         ax = axes[i]
@@ -401,40 +424,83 @@ def plot_attention(image_path, words, alphas, max_words=12):
     plt.tight_layout()
     plt.show()
 
+import os
+import random
+import shutil
+from pathlib import Path
 
-# %% [markdown]
-# ## 5. Demonstration on unseen test images
-#
-# Point `CHECKPOINT_FILE` at your trained `best_model.pth.tar` and
-# `TEST_IMAGE_DIR` at a folder of held-out images (e.g. the `test_loader`
-# split saved during training, or any new images).
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+SOURCE_IMAGE_DIRS = [Path("content/Images"), Path("caption_data/Images"), Path("Images")]
+TEST_IMAGE_DIR = Path("content/test_images")
+TEST_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-# %%
-CHECKPOINT_FILE = "experiments/<your_run>/weights/best_model.pth.tar"
-TEST_IMAGE_DIR = "caption_data/test_images"
+source_dir = next((p for p in SOURCE_IMAGE_DIRS if p.exists()), None)
+if source_dir is None:
+    print("No image source directory found. Checked: content/Images, caption_data/Images, Images")
+else:
+    image_files = sorted([p for p in source_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS])
+    random.seed(42)
+    selected = random.sample(image_files, min(800, len(image_files)))
+
+    for image_path in selected:
+        destination = TEST_IMAGE_DIR / image_path.name
+        if not destination.exists():
+            shutil.copy2(image_path, destination)
+
+    print(f"Prepared {len(selected)} images in {TEST_IMAGE_DIR}")
+    print(f"Source directory: {source_dir}")
+
+from pathlib import Path
+
+# Auto-detect checkpoint instead of relying on one hard-coded timestamped folder.
+checkpoint_candidates = sorted(Path("experiments").glob("**/best_model.pth.tar"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+if checkpoint_candidates:
+    CHECKPOINT_FILE = str(checkpoint_candidates[0])
+else:
+    CHECKPOINT_FILE = "experiments/2026-07-02_13-25-57_ResNet50_Attn_LSTM_fixed/weights/best_model.pth.tar"
+
+TEST_IMAGE_DIR = "content/test_images"
 
 caption_model = None
 if os.path.exists(CHECKPOINT_FILE):
     caption_model = CaptionModel.from_checkpoint(CHECKPOINT_FILE)
 else:
-    print(f"Checkpoint not found at {CHECKPOINT_FILE} -- update the path and rerun.")
+    print(f"Checkpoint not found at {CHECKPOINT_FILE}. Train the model first or update CHECKPOINT_FILE.")
 
-# %%
+# Generate only a small preview by default, so the notebook does not look stuck.
+# Increase MAX_PREVIEW_IMAGES if you want more examples.
+MAX_PREVIEW_IMAGES = 10
+
 if caption_model is not None and os.path.isdir(TEST_IMAGE_DIR):
-    all_captions = generate_captions_for_dir(TEST_IMAGE_DIR, caption_model)
-    for fname, cap in list(all_captions.items())[:10]:
+    preview_files = sorted(
+        f for f in os.listdir(TEST_IMAGE_DIR)
+        if Path(f).suffix.lower() in IMAGE_EXTENSIONS
+    )[:MAX_PREVIEW_IMAGES]
+
+    all_captions = {}
+    for fname in preview_files:
+        path = os.path.join(TEST_IMAGE_DIR, fname)
+        cap = generate_caption(path, caption_model)
+        all_captions[fname] = cap
         print(f"{fname}: {cap}")
 else:
     print(f"Test image directory not found at {TEST_IMAGE_DIR} -- update the path and rerun.")
 
-# %% [markdown]
-# ### Single-image example + attention visualization
-
-# %%
 if caption_model is not None:
+    # Do not require a file named test_image.jpg. Use it if present; otherwise use the first prepared test image.
     IMAGE_FILE = "test_image.jpg"
-    if os.path.exists(IMAGE_FILE):
+    if not os.path.exists(IMAGE_FILE) and os.path.isdir(TEST_IMAGE_DIR):
+        test_images = sorted(
+            os.path.join(TEST_IMAGE_DIR, f)
+            for f in os.listdir(TEST_IMAGE_DIR)
+            if Path(f).suffix.lower() in IMAGE_EXTENSIONS
+        )
+        IMAGE_FILE = test_images[0] if test_images else None
+
+    if IMAGE_FILE and os.path.exists(IMAGE_FILE):
         caption = generate_caption(IMAGE_FILE, caption_model)
+        print("Image:", IMAGE_FILE)
         print("Caption:", caption)
 
         image_tensor = caption_model.transform(
@@ -445,35 +511,26 @@ if caption_model is not None:
         )
         plot_attention(IMAGE_FILE, words, alphas)
     else:
-        print(f"Image {IMAGE_FILE} not found -- update the path and rerun.")
+        print("No test image found. Put an image at test_image.jpg or make sure TEST_IMAGE_DIR contains images.")
 
-
-# %% [markdown]
-# ## 6. Analysis: successes and failure cases
-#
-# Fill this section in with concrete examples once you've run the model on
-# the test set above. For each example, include the image, the generated
-# caption, and a short note on *why* it worked or failed (e.g. object
-# confusion, missed action, wrong count, hallucinated object/setting,
-# attention drifting off the relevant region).
-#
-# **Successful captions:**
-# - _Add 2-3 examples: image filename, generated caption, and why it's accurate._
-#
-# **Failure cases:**
-# - _Add 2-3 examples: image filename, generated caption, and what went wrong
-#   (e.g. compare against the attention map from Section 4 to see where the
-#   model was "looking")._
-
-# %%
+# Script-style quick test. This now also uses an existing test image automatically.
 if __name__ == "__main__":
-    if not os.path.exists(CHECKPOINT_FILE):
-        print(f"Checkpoint not found at {CHECKPOINT_FILE} -- update the path and rerun.")
+    if caption_model is None:
+        print("Model was not loaded. Check CHECKPOINT_FILE above.")
     else:
-        model = CaptionModel.from_checkpoint(CHECKPOINT_FILE)
         IMAGE_FILE = "test_image.jpg"
-        if not os.path.exists(IMAGE_FILE):
-            print(f"Image {IMAGE_FILE} not found -- update the path and rerun.")
-        else:
+        if not os.path.exists(IMAGE_FILE) and os.path.isdir(TEST_IMAGE_DIR):
+            test_images = sorted(
+                os.path.join(TEST_IMAGE_DIR, f)
+                for f in os.listdir(TEST_IMAGE_DIR)
+                if Path(f).suffix.lower() in IMAGE_EXTENSIONS
+            )
+            IMAGE_FILE = test_images[0] if test_images else None
+
+        if IMAGE_FILE and os.path.exists(IMAGE_FILE):
+            print("Image:", IMAGE_FILE)
             print("Caption:")
-            print(generate_caption(IMAGE_FILE, model))
+            print(generate_caption(IMAGE_FILE, caption_model))
+        else:
+            print("No test image found. Put an image at test_image.jpg or make sure TEST_IMAGE_DIR contains images.")
+
