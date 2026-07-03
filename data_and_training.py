@@ -1,21 +1,3 @@
-# %% [markdown]
-# # The Visual Storyteller — Data & Training
-#
-# This notebook covers:
-# 1. **Data Loading** — Vocabulary building, `Dataset`/`DataLoader` construction from
-#    the Flickr-style `images/` + `captions.txt` layout.
-# 2. **Model Definition** — A ResNet-101 CNN encoder + attention-based LSTM decoder
-#    (Show, Attend and Tell style) that generates captions conditioned on an image.
-# 3. **Training** — The training/validation loop, teacher-forcing schedule,
-#    progressive encoder fine-tuning, and BLEU tracking.
-# 4. **Save** — Checkpointing of model weights, optimizer state, vocab, and config.
-#
-# Combined from: `data_loader.py`, `model.py`, `utils.py`, `train.py`.
-
-# %% [markdown]
-# ## 0. Setup
-
-# %%
 import os
 import re
 import json
@@ -39,18 +21,6 @@ from tqdm import tqdm
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
-
-# %% [markdown]
-# ## 1. Data Loading
-#
-# Includes the `Vocabulary` (tokenizer + word<->index mappings), the `FlickrDataset`
-# (loads an image + numericalizes one of its captions), collation for padding batches,
-# image transforms, and `get_loaders(...)`, which reads `captions.txt`, splits by
-# **unique image id** (so all 5 captions for an image stay in the same split), builds
-# the vocabulary from the training captions only, and returns train/val/test
-# `DataLoader`s.
-
-# %%
 class Vocabulary:
     def __init__(self, freq_threshold):
         self.itos = {0: "<PAD>", 1: "<SOS>", 2: "<EOS>", 3: "<UNK>"}
@@ -91,8 +61,6 @@ class Vocabulary:
             for token in tokenized_text
         ]
 
-
-# %%
 class FlickrDataset(Dataset):
     def __init__(self, root_dir, imgs, captions, vocab, transform=None):
         self.root_dir = root_dir
@@ -100,6 +68,7 @@ class FlickrDataset(Dataset):
         self.captions = captions
         self.vocab = vocab
         self.transform = transform
+        self._warned_bad_images = 0
 
     def __len__(self):
         return len(self.imgs)
@@ -109,20 +78,27 @@ class FlickrDataset(Dataset):
         return Image.open(img_path).convert("RGB")
 
     def __getitem__(self, index):
-        caption = self.captions[index]
-
-        try:
-            image = self._load_image(index)
-        except (FileNotFoundError, UnidentifiedImageError, OSError) as e:
-            # A handful of images in scraped Flickr-style datasets are
-            # missing or corrupted. Rather than crashing the whole training
-            # run over one bad file, fall back to a different sample so the
-            # DataLoader keeps going -- and let it be visible in logs once,
-            # not silently swallowed forever.
-            print(f"[FlickrDataset] Skipping unreadable image '{self.imgs[index]}' ({e}); "
-                  f"substituting a different sample.")
-            fallback_index = random.randrange(len(self.imgs))
-            return self.__getitem__(fallback_index)
+        # The old version used recursive random fallback for unreadable images.
+        # If several paths are bad, that can loop for a long time and make epoch 1
+        # look frozen. This bounded fallback tries nearby samples and then fails
+        # clearly if the dataset paths are actually broken.
+        last_error = None
+        for offset in range(len(self.imgs)):
+            idx = (index + offset) % len(self.imgs)
+            caption = self.captions[idx]
+            try:
+                image = self._load_image(idx)
+                break
+            except (FileNotFoundError, UnidentifiedImageError, OSError) as e:
+                last_error = e
+                if self._warned_bad_images < 5:
+                    print(f"[FlickrDataset] Skipping unreadable image '{self.imgs[idx]}' ({e}).")
+                    self._warned_bad_images += 1
+        else:
+            raise RuntimeError(
+                "No readable images were found. Check that content/Images and captions.txt "
+                f"match correctly. Last error: {last_error}"
+            )
 
         if self.transform is not None:
             image = self.transform(image)
@@ -133,8 +109,6 @@ class FlickrDataset(Dataset):
 
         return image, torch.tensor(numericalized_caption)
 
-
-# %%
 def collate_batch_first(batch, pad_idx):
     """
     Pads a batch of (image, caption) pairs. Captions come back batch-first,
@@ -156,8 +130,6 @@ class CaptionCollate:
     def __call__(self, batch):
         return collate_batch_first(batch, self.pad_idx)
 
-
-# %%
 def get_transforms(train=True):
     if train:
         return transforms.Compose([
@@ -176,8 +148,6 @@ def get_transforms(train=True):
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])
 
-
-# %%
 def _read_annotations(annotation_file, max_caption_length=40):
     """
     Parses the "image,caption" CSV-style file. Also drops captions that
@@ -234,18 +204,16 @@ def _split_by_image(all_imgs, val_size, test_size, split_seed=42):
     test_ids = set(unique_imgs[train_count + v_count:])
     return train_ids, val_ids, test_ids
 
-
-# %%
 def get_loaders(
         root_folder,
         annotation_file,
         transform=None,
         train_transform=None,
         val_transform=None,
-        batch_size=32,
-        num_workers=2,
+        batch_size=64,
+        num_workers=0,
         shuffle=True,
-        pin_memory=True,
+        pin_memory=None,
         test_size=0.1,
         val_size=0.1,
         freq_threshold=5,
@@ -288,42 +256,36 @@ def get_loaders(
     pad_idx = vocab.stoi["<PAD>"]
     collate_fn = CaptionCollate(pad_idx)
 
+    # Notebook/Windows stability fix: num_workers=0 avoids the common epoch-1
+    # multiprocessing hang. If you run as a .py script on Linux, you can raise it.
+    if num_workers is None:
+        num_workers = 0
+    if pin_memory is None:
+        pin_memory = torch.cuda.is_available()
+
+    loader_kwargs = dict(
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=collate_fn,
+        persistent_workers=(num_workers > 0),
+    )
+
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, num_workers=num_workers,
-        shuffle=shuffle, pin_memory=pin_memory, collate_fn=collate_fn,
+        train_dataset, batch_size=batch_size, shuffle=shuffle,
         drop_last=True,  # keeps every training batch a consistent size
-        persistent_workers=num_workers > 0,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, num_workers=num_workers,
-        shuffle=False, pin_memory=pin_memory, collate_fn=collate_fn,
-        persistent_workers=num_workers > 0,
+        val_dataset, batch_size=batch_size, shuffle=False,
+        **loader_kwargs,
     )
     test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, num_workers=num_workers,
-        shuffle=False, pin_memory=pin_memory, collate_fn=collate_fn,
-        persistent_workers=num_workers > 0,
+        test_dataset, batch_size=batch_size, shuffle=False,
+        **loader_kwargs,
     )
 
     return train_loader, val_loader, test_loader, vocab
 
-
-# %% [markdown]
-# ## 2. Model Definition
-#
-# - `EncoderCNN`: ResNet-101 backbone (ImageNet pretrained) with the final
-#   pooling/FC layers removed, producing a spatial grid of features so the
-#   decoder can attend over image regions.
-# - `Attention`: Bahdanau-style (concat + tanh + softmax) attention over the
-#   encoder's spatial grid, conditioned on the decoder's previous hidden state.
-# - `DecoderRNN`: An `LSTMCell`-based decoder with attention and scheduled
-#   sampling (teacher forcing ratio controls how often it sees the ground-truth
-#   previous token vs. its own prediction).
-# - `CNNtoRNN`: Wraps the encoder + decoder together, and exposes
-#   `caption_image` (greedy decoding) and `beam_search_caption` (beam search)
-#   for inference.
-
-# %%
 class EncoderCNN(nn.Module):
     """
     CNN encoder that outputs a spatial grid of features instead of a single
@@ -331,7 +293,7 @@ class EncoderCNN(nn.Module):
     image at each generation step.
     """
 
-    def __init__(self, encoded_image_size=8, fine_tune=False):
+    def __init__(self, encoded_image_size=5, fine_tune=False):
         super(EncoderCNN, self).__init__()
         self.encoded_image_size = encoded_image_size
 
@@ -368,8 +330,6 @@ class EncoderCNN(nn.Module):
                 for p in block.parameters():
                     p.requires_grad = True
 
-
-# %%
 class Attention(nn.Module):
     """
     Bahdanau-style (concat) attention: the encoder features and the decoder's
@@ -392,8 +352,6 @@ class Attention(nn.Module):
         context = (encoder_out * alpha.unsqueeze(2)).sum(dim=1)  # (B, encoder_dim)
         return context, alpha
 
-
-# %%
 class DecoderRNN(nn.Module):
     """
     LSTMCell-based decoder with attention and scheduled sampling.
@@ -472,8 +430,6 @@ class DecoderRNN(nn.Module):
 
         return predictions, alphas
 
-
-# %%
 class CNNtoRNN(nn.Module):
     def __init__(self, embed_size, hidden_size, vocab_size, attention_dim=256,
                  encoder_dim=2048, dropout=0.5, fine_tune_encoder=False):
@@ -494,7 +450,16 @@ class CNNtoRNN(nn.Module):
         Returns predictions (B, T-1, vocab_size) and attention weights for
         optional regularization; compare predictions against captions[:, 1:].
         """
-        encoder_out = self.encoderCNN(images)
+        # Speed/memory fix: while the CNN encoder is frozen, do not build a
+        # ResNet autograd graph. This makes epoch 1 much less likely to crawl
+        # or run out of memory, especially on CPU.
+        encoder_trainable = any(p.requires_grad for p in self.encoderCNN.parameters())
+        if encoder_trainable:
+            encoder_out = self.encoderCNN(images)
+        else:
+            self.encoderCNN.eval()
+            with torch.no_grad():
+                encoder_out = self.encoderCNN(images)
         predictions, alphas = self.decoderRNN(encoder_out, captions, teacher_forcing_ratio)
         return predictions, alphas
 
@@ -502,7 +467,9 @@ class CNNtoRNN(nn.Module):
         self.encoderCNN.set_fine_tune(fine_tune=True)
 
     @torch.no_grad()
-    def caption_image(self, image, vocabulary, max_length=50, device="cuda"):
+    def caption_image(self, image, vocabulary, max_length=50, device=None):
+        device = device or image.device
+        device = device or image.device
         self.eval()
         encoder_out = self.encoderCNN(image)  # (1, L, encoder_dim)
 
@@ -530,7 +497,8 @@ class CNNtoRNN(nn.Module):
         return result_caption
 
     @torch.no_grad()
-    def beam_search_caption(self, image, vocabulary, max_length=50, beam_width=3, device="cuda"):
+    def beam_search_caption(self, image, vocabulary, max_length=50, beam_width=3, device=None):
+        device = device or image.device
         self.eval()
         encoder_out = self.encoderCNN(image)  # (1, L, encoder_dim)
         h0, c0 = self.decoderRNN.init_hidden_state(encoder_out)
@@ -585,16 +553,6 @@ class CNNtoRNN(nn.Module):
         self.train()
         return result_caption
 
-
-# %% [markdown]
-# ## 3. Training helpers
-#
-# `seed_everything` (reproducibility), `Experiment` (creates a timestamped
-# `experiments/<name>/` directory with `config.json`, `logs/`, `weights/`),
-# `evaluate_bleu` (periodic BLEU-4 tracking on validation data), and
-# `print_examples` (qualitative prediction-vs-truth spot checks).
-
-# %%
 def seed_everything(seed=42):
     """Sets the seed for reproducibility across all libraries."""
     random.seed(seed)
@@ -638,8 +596,6 @@ class Experiment:
     def get_checkpoint_path(self, epoch):
         return os.path.join(self.weights_dir, f"checkpoint_epoch_{epoch}.pth.tar")
 
-
-# %%
 def _generate(model, img, vocab, device, use_beam_search=False, beam_width=3):
     """Small shared helper so print_examples/evaluate_bleu don't duplicate
     the greedy-vs-beam branching logic."""
@@ -729,26 +685,9 @@ def evaluate_bleu(loader, model, device, vocab, limit_batches=50,
     model.train()
     return score.item()
 
-
-# %% [markdown]
-# ## 4. Training
-#
-# `get_teacher_forcing_ratio` linearly decays teacher forcing across epochs
-# (starts near ground-truth-heavy, ends closer to the model's own
-# predictions, matching inference conditions). `run_epoch` is the shared
-# train/eval step used for both phases. `train(...)` wires everything
-# together: builds loaders + model + optimizer, runs the epoch loop with
-# early stopping, periodic BLEU evaluation, progressive encoder fine-tuning,
-# and checkpointing (**Save**, step 4 of the deliverable).
-
-# %%
 def get_teacher_forcing_ratio(epoch, num_epochs, start=1.0, end=0.7):
     """
     Linearly decays teacher forcing from `start` to `end` across training.
-    Early on, the model leans on ground-truth tokens to learn basic word
-    order and vocabulary. Later, it's increasingly forced to condition on
-    its own predictions, which better matches what happens at inference
-    time and tends to produce more robust captions.
     """
     if num_epochs <= 1:
         return start
@@ -759,47 +698,47 @@ def get_teacher_forcing_ratio(epoch, num_epochs, start=1.0, end=0.7):
 def run_epoch(model, loader, criterion, device, vocab, optimizer=None,
               teacher_forcing_ratio=1.0, grad_clip=None,
               doubly_stochastic_lambda=0.0, writer=None, epoch=0,
-              step_offset=0, tqdm_disable=False):
+              step_offset=0, tqdm_disable=False, max_batches=None):
     """
     Shared logic for one pass over a loader. If `optimizer` is provided,
     runs in training mode with backprop; otherwise runs a no-grad eval pass.
-    Returns (average_loss, next_step).
+
+    `max_batches` is optional and useful for a quick smoke test before a full run.
     """
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
 
-    loop = loader if tqdm_disable else tqdm(loader, leave=True)
+    total_batches = len(loader) if max_batches is None else min(len(loader), max_batches)
+    loop = loader if tqdm_disable else tqdm(loader, total=total_batches, leave=True, mininterval=1.0)
     total_loss = 0.0
     step = step_offset
+    batches_done = 0
 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
-        for imgs, captions in loop:
-            imgs = imgs.to(device)
-            # collate_fn returns captions batch-first, (B, T), matching what
-            # the model expects directly.
-            captions = captions.to(device)
+        for batch_idx, (imgs, captions) in enumerate(loop):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+
+            imgs = imgs.to(device, non_blocking=True)
+            captions = captions.to(device, non_blocking=True)
 
             predictions, alphas = model(
                 imgs, captions,
                 teacher_forcing_ratio=teacher_forcing_ratio if is_train else 1.0
             )
 
-            targets = captions[:, 1:]  # everything after <SOS>
+            targets = captions[:, 1:]
             loss = criterion(
                 predictions.reshape(-1, predictions.shape[-1]),
                 targets.reshape(-1),
             )
 
             if doubly_stochastic_lambda > 0:
-                # Encourages the attention weights for each pixel to sum to
-                # ~1 across the whole generated sequence (Show, Attend and
-                # Tell regularization) -- keeps attention from collapsing
-                # onto a few regions and tends to sharpen captions.
                 loss = loss + doubly_stochastic_lambda * ((1. - alphas.sum(dim=1)) ** 2).mean()
 
             if is_train:
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 if grad_clip is not None:
                     nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -810,29 +749,31 @@ def run_epoch(model, loader, criterion, device, vocab, optimizer=None,
                 step += 1
 
             total_loss += loss.item()
+            batches_done += 1
 
             if not tqdm_disable:
                 loop.set_description(f"Epoch [{epoch + 1}]" + (" Train" if is_train else " Val"))
-                loop.set_postfix(loss=loss.item())
+                loop.set_postfix(loss=f"{loss.item():.4f}", batch=f"{batches_done}/{total_batches}")
 
-    avg_loss = total_loss / len(loader)
+    if batches_done == 0:
+        raise RuntimeError("The DataLoader produced 0 batches. Lower batch_size or check dataset split sizes.")
+
+    avg_loss = total_loss / batches_done
     return avg_loss, step
 
-
-# %%
 def train(config=None):
     default_config = {
-        "experiment_name": "ResNet101_Attn_LSTM_v2",
+        "experiment_name": "ResNet50_Attn_LSTM_fixed",
         "seed": 42,
         "learning_rate": 3e-4,
         "batch_size": 16,
-        "embed_size": 256,
-        "hidden_size": 512,
+        "embed_size": 128,
+        "hidden_size": 256,
         "attention_dim": 256,
         "dropout": 0.5,
         "num_epochs": 30,
         "save_model": True,
-        "num_workers": 6,
+        "num_workers": 0,  # IMPORTANT: safer for Windows/Jupyter; prevents epoch-1 worker hangs
         "freq_threshold": 5,
 
         # Teacher forcing schedule
@@ -849,12 +790,15 @@ def train(config=None):
 
         "optimizer": "Adam",
         "patience": 5,
-        "bleu_every_n_epochs": 5,
+        "bleu_every_n_epochs": 10,
 
         "load_model": False,
         "checkpoint_path": None,
 
         "tqdm_disable": False,
+        "pin_memory": None,
+        "max_train_batches": None,  # set e.g. 20 for a quick smoke test
+        "max_val_batches": None,
     }
 
     if config:
@@ -871,20 +815,39 @@ def train(config=None):
     print(f"Using device: {device}")
 
     print("Loading data...")
+    base_dir = os.path.abspath(os.path.join(os.getcwd(), "content"))
+    if not os.path.isdir(base_dir):
+        base_dir = os.path.abspath(os.path.join(os.getcwd(), "..", "content"))
+
+    root_folder = os.path.join(base_dir, "Images")
+    annotation_file = os.path.join(base_dir, "captions.txt")
+
+    if not os.path.isdir(root_folder) or not os.path.exists(annotation_file):
+        raise FileNotFoundError(
+            f"Expected dataset at '{root_folder}' and '{annotation_file}'. "
+            "Update the paths if your folder is named differently."
+        )
+
     train_transform = get_transforms(train=True)
     val_transform = get_transforms(train=False)
 
     train_loader, val_loader, test_loader, vocab = get_loaders(
-        root_folder="caption_data/Images",
-        annotation_file="caption_data/captions.txt",
+        root_folder=root_folder,
+        annotation_file=annotation_file,
         train_transform=train_transform,
         val_transform=val_transform,
         batch_size=config["batch_size"],
         num_workers=config["num_workers"],
+        pin_memory=config["pin_memory"],
         freq_threshold=config["freq_threshold"],
     )
     torch.save(vocab, os.path.join(experiment.dir, "vocab.pth"))
     print(f"Vocab size: {len(vocab)}")
+    print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}, Test batches: {len(test_loader)}")
+
+    # Fail fast before epoch 1 if the dataset/loader has a path or multiprocessing issue.
+    sample_imgs, sample_caps = next(iter(train_loader))
+    print(f"Sanity batch loaded: images={tuple(sample_imgs.shape)}, captions={tuple(sample_caps.shape)}")
 
     model = CNNtoRNN(
         embed_size=config["embed_size"],
@@ -953,6 +916,7 @@ def train(config=None):
             doubly_stochastic_lambda=config["doubly_stochastic_lambda"],
             writer=writer, epoch=epoch, step_offset=step,
             tqdm_disable=config["tqdm_disable"],
+            max_batches=config["max_train_batches"],
         )
         print(f"Average Train Loss: {avg_train_loss:.4f}")
         writer.add_scalar("Training/Epoch_Loss", avg_train_loss, epoch)
@@ -963,6 +927,7 @@ def train(config=None):
             optimizer=None,
             doubly_stochastic_lambda=config["doubly_stochastic_lambda"],
             epoch=epoch, tqdm_disable=config["tqdm_disable"],
+            max_batches=config["max_val_batches"],
         )
         print(f"Average Val Loss: {avg_val_loss:.4f}")
         writer.add_scalar("Validation/Epoch_Loss", avg_val_loss, epoch)
@@ -1014,17 +979,16 @@ def train(config=None):
     }
 
 
-# %% [markdown]
-# ## 5. Run training
-#
-# Adjust the config as needed (e.g. lower `num_epochs` / `batch_size` for a
-# quick smoke test) before a full run. `train()` handles the Save step
-# internally (per-epoch checkpoints + `best_model.pth.tar`, plus `vocab.pth`
-# and `config.json` written into the experiment directory).
-
-# %%
 if __name__ == "__main__":
     results = train({
-        # "num_epochs": 100,   # override defaults here as needed
+        # Stable notebook defaults. On Windows/Jupyter, keep num_workers=0.
+        "num_workers": 0,
+        "batch_size": 16,
+
+        # For a quick test, uncomment these two lines first:
+        # "max_train_batches": 20,
+        # "max_val_batches": 5,
+        # "num_epochs": 1,
     })
     print(f"Model artifacts saved to: {results['experiment_dir']}")
+
